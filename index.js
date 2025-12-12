@@ -401,7 +401,7 @@ function snapshotMeta(ev) {
 }
 
 /* =========================
-   UPDATE EMBEDS - EXACTLY YOUR WORDING
+   UPDATE EMBEDS - YOUR TEMPLATES + BACKTICKS
 ========================= */
 function buildUpdateEmbed({ type, ev, oldMeta }) {
   const link = eventLink(ev);
@@ -418,12 +418,12 @@ function buildUpdateEmbed({ type, ev, oldMeta }) {
       .setDescription("אירוע שתוכנן מראש **בוטל**.\nלהלן פרטי האירוע כפי שהיו לפני הביטול:")
       .setColor(15158332)
       .addFields(
-        { name: "🛠 פעולה", value: "בוטל", inline: true },
-        { name: "📅 תאריך הביטול", value: today, inline: true },
+        { name: "🛠 פעולה", value: "`בוטל`", inline: true },
+        { name: "📅 תאריך הביטול", value: `\`${today}\``, inline: true },
         { name: SEP_NAME, value: "📌 **פרטי האירוע (לפני הביטול)**" },
-        { name: "📝 כותרת האירוע", value: `**${oldSafe.title}**` },
-        { name: "📆 תאריך", value: oldSafe.dateText, inline: true },
-        { name: "⏰ שעה", value: oldSafe.timeText, inline: true }
+        { name: "📝 כותרת האירוע", value: `**\`${oldSafe.title}\`**` },
+        { name: "📆 תאריך", value: `\`${oldSafe.dateText}\``, inline: true },
+        { name: "⏰ שעה", value: `\`${oldSafe.timeText}\``, inline: true }
       )
       .setFooter({ text: "חבילת העריכה הכוללת - מערכת אירועים" });
 
@@ -435,7 +435,6 @@ function buildUpdateEmbed({ type, ev, oldMeta }) {
         )
       );
     }
-
     return { embed, components };
   }
 
@@ -445,12 +444,12 @@ function buildUpdateEmbed({ type, ev, oldMeta }) {
       .setDescription("אירוע חדש **נוסף ליומן**.\nלהלן פרטי האירוע:")
       .setColor(5763719)
       .addFields(
-        { name: "🛠 פעולה", value: "אירוע חדש", inline: true },
-        { name: "📅 תאריך פרסום", value: today, inline: true },
+        { name: "🛠 פעולה", value: "`אירוע חדש`", inline: true },
+        { name: "📅 תאריך פרסום", value: `\`${today}\``, inline: true },
         { name: SEP_NAME, value: "📌 **פרטי האירוע**" },
-        { name: "📝 כותרת האירוע", value: `**${newMeta.title}**` },
-        { name: "📆 תאריך", value: newMeta.dateText, inline: true },
-        { name: "⏰ שעה", value: newMeta.timeText, inline: true }
+        { name: "📝 כותרת האירוע", value: `**\`${newMeta.title}\`**` },
+        { name: "📆 תאריך", value: `\`${newMeta.dateText}\``, inline: true },
+        { name: "⏰ שעה", value: `\`${newMeta.timeText}\``, inline: true }
       )
       .setFooter({ text: "חבילת העריכה הכוללת - מערכת אירועים" });
 
@@ -462,7 +461,6 @@ function buildUpdateEmbed({ type, ev, oldMeta }) {
         )
       );
     }
-
     return { embed, components };
   }
 
@@ -472,18 +470,18 @@ function buildUpdateEmbed({ type, ev, oldMeta }) {
     .setDescription("אירוע קיים **עודכן**.\nלהלן פרטי האירוע לפני ואחרי העדכון:")
     .setColor(16705372)
     .addFields(
-      { name: "🛠 פעולה", value: "עודכן", inline: true },
-      { name: "📅 תאריך העדכון", value: today, inline: true },
+      { name: "🛠 פעולה", value: "`עודכן`", inline: true },
+      { name: "📅 תאריך העדכון", value: `\`${today}\``, inline: true },
 
       { name: SEP_NAME, value: "📌 **פרטי האירוע (לפני העדכון)**" },
-      { name: "📝 כותרת האירוע", value: oldSafe.title },
-      { name: "📆 תאריך", value: oldSafe.dateText, inline: true },
-      { name: "⏰ שעה", value: oldSafe.timeText, inline: true },
+      { name: "📝 כותרת האירוע", value: `\`${oldSafe.title}\`` },
+      { name: "📆 תאריך", value: `\`${oldSafe.dateText}\``, inline: true },
+      { name: "⏰ שעה", value: `\`${oldSafe.timeText}\``, inline: true },
 
       { name: SEP_NAME, value: "__📌 **פרטי האירוע (לאחר העדכון)**__" },
-      { name: "📝 כותרת האירוע", value: `**${newMeta.title}**` },
-      { name: "📆 תאריך", value: newMeta.dateText, inline: true },
-      { name: "⏰ שעה", value: newMeta.timeText, inline: true }
+      { name: "📝 כותרת האירוע", value: `**\`${newMeta.title}\`**` },
+      { name: "📆 תאריך", value: `\`${newMeta.dateText}\``, inline: true },
+      { name: "⏰ שעה", value: `\`${newMeta.timeText}\``, inline: true }
     )
     .setFooter({ text: "חבילת העריכה הכוללת - מערכת אירועים" });
 
@@ -640,7 +638,6 @@ app.post("/webhook/google", async (req, res) => {
 
     // לא שולחים הודעות "sync" כדי לא להספים
     if (resourceState === "sync") return;
-
     if (items.length === 0) return;
 
     const updatesChannel = await discordClient.channels.fetch(UPDATES_CHANNEL_ID);
