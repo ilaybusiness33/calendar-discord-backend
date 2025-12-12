@@ -1,36 +1,91 @@
 const express = require("express");
 const { Client, GatewayIntentBits } = require("discord.js");
+const { google } = require("googleapis");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// דיסקורד
-const client = new Client({
+/* =========================
+   Discord Bot
+========================= */
+const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-client.once("ready", () => {
-  console.log(`Discord bot logged in as ${client.user.tag}`);
+discordClient.once("ready", () => {
+  console.log(`Discord bot logged in as ${discordClient.user.tag}`);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+discordClient.login(process.env.DISCORD_TOKEN);
 
-// בדיקה – שליחת הודעה
-app.get("/test-discord", async (req, res) => {
+/* =========================
+   Google OAuth
+========================= */
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+/* התחלת OAuth */
+app.get("/auth/google", (req, res) => {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    scope: ["https://www.googleapis.com/auth/calendar.readonly"],
+    prompt: "consent"
+  });
+
+  res.redirect(url);
+});
+
+/* חזרה מגוגל אחרי אישור */
+app.get("/oauth/callback", async (req, res) => {
   try {
-    const channel = await client.channels.fetch(
-      process.env.DISCORD_CHANNEL_ID
-    );
+    const { code } = req.query;
 
-    await channel.send("✅ הודעת בדיקה מה־Backend!");
+    if (!code) {
+      return res.status(400).send("Missing code");
+    }
 
-    res.send("Message sent to Discord");
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    console.log("Google OAuth success");
+    res.send("✅ Google Calendar connected successfully!");
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Failed to send message");
+    console.error("OAuth error:", err);
+    res.status(500).send("OAuth failed");
   }
 });
 
+/* =========================
+   בדיקה – קריאת אירועים
+   (יומן אחד בלבד!)
+========================= */
+app.get("/test-calendar", async (req, res) => {
+  try {
+    const calendar = google.calendar({
+      version: "v3",
+      auth: oauth2Client
+    });
+
+    const response = await calendar.events.list({
+      calendarId: process.env.GCAL_CALENDAR_ID,
+      maxResults: 10,
+      singleEvents: true,
+      orderBy: "startTime"
+    });
+
+    res.json(response.data.items || []);
+  } catch (err) {
+    console.error("Calendar error:", err);
+    res.status(500).send("Failed to fetch calendar events");
+  }
+});
+
+/* =========================
+   בדיקת חיים
+========================= */
 app.get("/", (req, res) => {
   res.send("Backend is running ✅");
 });
