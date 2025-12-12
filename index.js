@@ -12,33 +12,66 @@ const {
 } = require("discord.js");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
 /* =========================
    ENV
 ========================= */
-const BOARD_CHANNEL_ID = process.env.BOARD_CHANNEL_ID || "1449107600024141865";
-const UPDATES_CHANNEL_ID = process.env.UPDATES_CHANNEL_ID || "1449054314327834717";
-const BOARD_MESSAGE_ID = process.env.BOARD_MESSAGE_ID || ""; // נשים אחרי setup
-
+const TZ = "Asia/Jerusalem";
 const CALENDAR_ID = process.env.GCAL_CALENDAR_ID;
 
-const TZ = "Asia/Jerusalem";
+const BOARD_CHANNEL_ID = process.env.BOARD_CHANNEL_ID || "1449107600024141865";
+const UPDATES_CHANNEL_ID = process.env.UPDATES_CHANNEL_ID || "1449054314327834717";
+
+let BOARD_MESSAGE_ID = process.env.BOARD_MESSAGE_ID || "";
+
+const AUTO_WATCH = process.env.AUTO_WATCH === "1";
+
+const EMBED_COLOR = 65528;
+const THUMB_URL =
+  "https://cdn.discordapp.com/attachments/1311690456974884874/1430985279388516385/8d7591e81b8c0282.png";
+
+const BOARD_REFRESH_MS = 60 * 1000; // כל דקה (כששירות ער)
 
 /* =========================
-   Discord Bot
+   Discord
 ========================= */
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-discordClient.once("ready", async () => {
+let readyOnce = false;
+async function onDiscordReady() {
+  if (readyOnce) return;
+  readyOnce = true;
+
   console.log(`Discord bot logged in as ${discordClient.user.tag}`);
+
   await warmupKnownEvents();
-  await updateMonthlyBoard({ createIfMissing: true });
-});
+  await ensureMonthlyBoardMessage();
+  await updateMonthlyBoardEmbed({ reason: "startup" });
+
+  // רענון אוטומטי כל דקה (כש-Render לא ישן)
+  setInterval(async () => {
+    try {
+      await updateMonthlyBoardEmbed({ reason: "interval" });
+    } catch (e) {
+      console.error("Auto board refresh failed:", e);
+    }
+  }, BOARD_REFRESH_MS);
+
+  // Watch אוטומטי אחרי Restart/Deploy
+  if (AUTO_WATCH) {
+    await startWatchSilently();
+  } else {
+    console.log("AUTO_WATCH is off. Run /watch/start manually if needed.");
+  }
+}
+
+// תאימות v14/v15
+discordClient.once("ready", onDiscordReady);
+discordClient.once("clientReady", onDiscordReady);
 
 discordClient.login(process.env.DISCORD_TOKEN);
 
@@ -58,304 +91,394 @@ if (process.env.GOOGLE_REFRESH_TOKEN) {
   console.log("GOOGLE_REFRESH_TOKEN is missing ⚠️");
 }
 
-function getCalendarClient() {
+function cal() {
   return google.calendar({ version: "v3", auth: oauth2Client });
 }
 
 /* =========================
-   Helpers - formatting
+   Date helpers
 ========================= */
-function fmtDate(d) {
-  return new Intl.DateTimeFormat("he-IL", {
+function dayNameHe(d) {
+  return new Intl.DateTimeFormat("he-IL", { timeZone: TZ, weekday: "long" }).format(d);
+}
+
+function dateShort(d) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: TZ,
     day: "2-digit",
     month: "2-digit",
-    year: "numeric"
-  }).format(d);
+    year: "2-digit"
+  }).formatToParts(d);
+
+  const dd = parts.find(p => p.type === "day")?.value || "00";
+  const mm = parts.find(p => p.type === "month")?.value || "00";
+  const yy = parts.find(p => p.type === "year")?.value || "00";
+
+  return `${dd}.${mm}.${yy}`;
 }
 
-function fmtTime(d) {
-  return new Intl.DateTimeFormat("he-IL", {
-    timeZone: TZ,
-    hour: "2-digit",
-    minute: "2-digit"
-  }).format(d);
+function timeHM(d) {
+  return new Intl.DateTimeFormat("he-IL", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }).format(d);
 }
 
-function toDateFromEventStart(ev) {
-  // all-day
-  if (ev?.start?.date) {
-    // ev.start.date is YYYY-MM-DD (no time)
-    return new Date(ev.start.date + "T00:00:00");
-  }
-  // timed
+function localDayKey(d) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(d); // YYYY-MM-DD
+}
+
+function eventStartDate(ev) {
+  if (ev?.start?.date) return new Date(ev.start.date + "T00:00:00");
   if (ev?.start?.dateTime) return new Date(ev.start.dateTime);
   return null;
 }
 
-function eventWhenText(ev) {
-  if (ev?.start?.date) {
-    const d = new Date(ev.start.date + "T00:00:00");
-    return `כל היום - ${fmtDate(d)}`;
-  }
-  if (ev?.start?.dateTime) {
-    const d = new Date(ev.start.dateTime);
-    return `${fmtDate(d)} - ${fmtTime(d)}`;
-  }
-  return "זמן לא ידוע";
+function isAllDay(ev) {
+  return !!ev?.start?.date;
+}
+
+function timeRangeLabel(ev) {
+  if (isAllDay(ev)) return "כל היום";
+
+  const s = ev?.start?.dateTime ? new Date(ev.start.dateTime) : null;
+  const e = ev?.end?.dateTime ? new Date(ev.end.dateTime) : null;
+
+  if (!s) return "זמן לא ידוע";
+  if (!e) return timeHM(s);
+
+  return `${timeHM(s)} - ${timeHM(e)}`;
+}
+
+function eventLink(ev) {
+  return ev?.htmlLink || "";
 }
 
 function safeTitle(ev) {
-  return (ev.summary || "(ללא כותרת)").trim();
-}
-
-function lineForEvent(ev) {
-  const title = safeTitle(ev);
-  const when = eventWhenText(ev);
-  const link = ev.htmlLink || "";
-  return `- **${title}**\n  - ${when}${link ? `\n  - ${link}` : ""}`;
-}
-
-function sameDay(a, b) {
-  const da = new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(a); // YYYY-MM-DD
-  const db = new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(b);
-  return da === db;
-}
-
-function dayKey(d) {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(d); // YYYY-MM-DD
+  return (ev?.summary || "(ללא כותרת)").trim();
 }
 
 /* =========================
-   Events fetching
+   Fetch events (next month)
 ========================= */
-async function fetchEventsRange({ timeMin, timeMax, showDeleted = false, orderBy = "startTime" }) {
-  const calendar = getCalendarClient();
-  const resp = await calendar.events.list({
+async function fetchNextMonthEvents({ showDeleted = false } = {}) {
+  const now = new Date();
+  const timeMin = new Date(now.getTime() - 12 * 60 * 60 * 1000).toISOString();
+  const timeMax = new Date(now.getTime() + 32 * 24 * 60 * 60 * 1000).toISOString();
+
+  const resp = await cal().events.list({
     calendarId: CALENDAR_ID,
     timeMin,
     timeMax,
     singleEvents: true,
-    orderBy,
+    orderBy: "startTime",
     showDeleted,
     maxResults: 250
   });
+
   return resp.data.items || [];
 }
 
 /* =========================
-   Monthly board rendering
+   Monthly Board Embed (your style)
 ========================= */
-function buildMonthlyEmbed(events) {
-  const now = new Date();
-  const monthName = new Intl.DateTimeFormat("he-IL", { timeZone: TZ, month: "long", year: "numeric" }).format(now);
+function buildMonthlyBoardEmbed(events) {
+  const active = events.filter(e => e.status !== "cancelled");
 
-  // group by day
   const byDay = new Map();
-  for (const ev of events) {
-    const d = toDateFromEventStart(ev);
+  for (const ev of active) {
+    const d = eventStartDate(ev);
     if (!d) continue;
-    const key = dayKey(d);
+    const key = localDayKey(d);
     if (!byDay.has(key)) byDay.set(key, []);
     byDay.get(key).push(ev);
   }
 
-  // build a compact list (next 30-35 days)
-  const keys = Array.from(byDay.keys()).sort();
-  let desc = "";
-  for (const k of keys) {
-    const dayEvents = byDay.get(k) || [];
-    // convert to nice heb date
-    const d = new Date(k + "T00:00:00");
-    const header = `📆 **${fmtDate(d)}**`;
-    const lines = dayEvents
-      .slice(0, 6)
-      .map(ev => {
-        const title = safeTitle(ev);
-        const when = ev.start?.date ? "כל היום" : fmtTime(new Date(ev.start.dateTime));
-        const link = ev.htmlLink ? ev.htmlLink : "";
-        return `- ${when} - ${link ? `[${title}](${link})` : `**${title}**`}`;
-      })
-      .join("\n");
-
-    desc += `${header}\n${lines}\n\n`;
-    if (desc.length > 3500) break; // safety for embed
-  }
-
-  if (!desc.trim()) {
-    desc = "אין אירועים החודש הקרוב (או שאין אירועים בטווח שהגדרנו).";
-  }
+  const days = Array.from(byDay.keys()).sort();
 
   const embed = new EmbedBuilder()
-    .setTitle(`🗓️ לוח חודשי - החודש הקרוב`)
-    .setDescription(desc.trim())
-    .setFooter({ text: `מתעדכן אוטומטית מהיומן - ${monthName}` });
+    .setTitle("📅🎬 חבילת העריכה הכוללת - לוח חודשי")
+    .setDescription(
+      "הלוח החודשי מציג את **כל האירועים והפעילויות הקרובות של החבילה**.\n*הלוח מתעדכן אוטומטית לפי אירועים שנקבעים ביומן גוגל.*"
+    )
+    .setColor(EMBED_COLOR)
+    .setThumbnail(THUMB_URL)
+    .setFooter({ text: "חבילת העריכה הכוללת - יומן רשמי" });
 
-  return embed;
-}
+  const fields = [];
+  const SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
-function buildTodayEmbed(events) {
-  const today = new Date();
-  const todayEvents = events.filter(ev => {
-    const d = toDateFromEventStart(ev);
-    return d && sameDay(d, today) && ev.status !== "cancelled";
-  });
+  // 25 fields מקסימום - 2 fields ליום -> 12 ימים = 24 fields
+  const MAX_DAYS = 12;
+  let usedDays = 0;
 
-  const embed = new EmbedBuilder()
-    .setTitle("📌 היום ביומן")
-    .setFooter({ text: "נשלח מהבוט - תצוגה יומית" });
+  for (const key of days) {
+    if (usedDays >= MAX_DAYS) break;
 
-  if (todayEvents.length === 0) {
-    embed.setDescription("אין אירועים להיום ✅");
-    return embed;
-  }
+    const d = new Date(key + "T00:00:00");
+    const weekday = dayNameHe(d);
+    const date = dateShort(d);
 
-  const lines = todayEvents
-    .slice(0, 15)
-    .map(ev => {
+    const dayEvents = (byDay.get(key) || []).slice().sort((a, b) => {
+      const aAll = isAllDay(a);
+      const bAll = isAllDay(b);
+      if (aAll && !bAll) return -1;
+      if (!aAll && bAll) return 1;
+
+      const aS = a?.start?.dateTime ? new Date(a.start.dateTime).getTime() : 0;
+      const bS = b?.start?.dateTime ? new Date(b.start.dateTime).getTime() : 0;
+      return aS - bS;
+    });
+
+    fields.push({
+      name: SEP,
+      value: `📆 **${weekday} - ${date}**`
+    });
+
+    const lines = dayEvents.map(ev => {
+      const t = timeRangeLabel(ev);
       const title = safeTitle(ev);
-      const when = ev.start?.date ? "כל היום" : fmtTime(new Date(ev.start.dateTime));
-      const link = ev.htmlLink ? ev.htmlLink : "";
-      return `- ${when} - ${link ? `[${title}](${link})` : `**${title}**`}`;
-    })
-    .join("\n");
+      return `🔹 **${t}** - \`${title}\``;
+    });
 
-  embed.setDescription(lines);
+    fields.push({
+      name: "\u200b",
+      value: lines.join("\n") || "—"
+    });
+
+    usedDays++;
+  }
+
+  if (days.length > usedDays) {
+    const left = days.length - usedDays;
+    fields.push({
+      name: SEP,
+      value:
+        `📌 יש עוד **${left}** ימים עם אירועים בחודש הקרוב.\n` +
+        `לצפייה מלאה: https://calendar.google.com/calendar/u/0/r?cid=${encodeURIComponent(CALENDAR_ID)}`
+    });
+  }
+
+  embed.addFields(fields.slice(0, 25));
   return embed;
 }
 
 function buildBoardButtons() {
   return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("board_today").setLabel("היום").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("board_refresh").setLabel("רענן").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
-      .setCustomId("board_today")
-      .setLabel("היום")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("board_refresh")
-      .setLabel("רענן")
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Link)
+      .setLabel("פתח ביומן")
+      .setURL(`https://calendar.google.com/calendar/u/0/r?cid=${encodeURIComponent(CALENDAR_ID)}`)
   );
 }
 
 /* =========================
-   Board message create/edit
+   Board message (edit, not resend)
 ========================= */
-let cachedBoardMessageId = BOARD_MESSAGE_ID;
-let boardUpdatePending = false;
+async function ensureMonthlyBoardMessage() {
+  const channel = await discordClient.channels.fetch(BOARD_CHANNEL_ID);
 
-async function updateMonthlyBoard({ createIfMissing = false } = {}) {
+  // אם יש MESSAGE_ID מה-ENV, נוודא שהוא קיים
+  if (BOARD_MESSAGE_ID) {
+    const existing = await channel.messages.fetch(BOARD_MESSAGE_ID).catch(() => null);
+    if (existing) return;
+    BOARD_MESSAGE_ID = "";
+  }
+
+  // אם אין — ניצור פעם אחת, ונגיד לך את ה-ID כדי לשים ב-ENV
+  const events = await fetchNextMonthEvents({ showDeleted: false });
+  const embed = buildMonthlyBoardEmbed(events);
+  const row = buildBoardButtons();
+
+  const msg = await channel.send({ embeds: [embed], components: [row] });
+  BOARD_MESSAGE_ID = msg.id;
+
+  console.log("✅ Board message created. Set BOARD_MESSAGE_ID in Render ENV to persist:");
+  console.log(BOARD_MESSAGE_ID);
+}
+
+let boardEditLock = false;
+async function updateMonthlyBoardEmbed({ reason = "unknown" } = {}) {
+  if (boardEditLock) return;
+  boardEditLock = true;
+
   try {
-    const now = new Date();
-    const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-    const timeMax = new Date(now.getTime() + 35 * 24 * 60 * 60 * 1000).toISOString();
+    const channel = await discordClient.channels.fetch(BOARD_CHANNEL_ID);
+    const msg = await channel.messages.fetch(BOARD_MESSAGE_ID).catch(() => null);
 
-    const events = await fetchEventsRange({ timeMin, timeMax, showDeleted: false, orderBy: "startTime" });
-    const embed = buildMonthlyEmbed(events);
+    // אם ההודעה נמחקה/לא קיימת, ניצור חדשה (רק פעם)
+    if (!msg) {
+      BOARD_MESSAGE_ID = "";
+      await ensureMonthlyBoardMessage();
+      return;
+    }
+
+    const events = await fetchNextMonthEvents({ showDeleted: false });
+    const embed = buildMonthlyBoardEmbed(events);
     const row = buildBoardButtons();
 
-    const channel = await discordClient.channels.fetch(BOARD_CHANNEL_ID);
-
-    if (!cachedBoardMessageId) {
-      if (!createIfMissing) return;
-
-      const msg = await channel.send({ embeds: [embed], components: [row] });
-      cachedBoardMessageId = msg.id;
-
-      console.log("✅ Monthly board message created. Set this in Render ENV as BOARD_MESSAGE_ID:");
-      console.log(cachedBoardMessageId);
-      return;
-    }
-
-    const msg = await channel.messages.fetch(cachedBoardMessageId).catch(() => null);
-
-    if (!msg) {
-      if (!createIfMissing) return;
-      const newMsg = await channel.send({ embeds: [embed], components: [row] });
-      cachedBoardMessageId = newMsg.id;
-
-      console.log("✅ Monthly board message re-created. Set this in Render ENV as BOARD_MESSAGE_ID:");
-      console.log(cachedBoardMessageId);
-      return;
-    }
-
     await msg.edit({ embeds: [embed], components: [row] });
+    // console.log(`Board updated (${reason})`);
   } catch (err) {
-    console.error("updateMonthlyBoard error:", err);
+    console.error("updateMonthlyBoardEmbed error:", err);
+  } finally {
+    boardEditLock = false;
   }
 }
 
-function scheduleBoardUpdate() {
-  if (boardUpdatePending) return;
-  boardUpdatePending = true;
-  setTimeout(async () => {
-    boardUpdatePending = false;
-    await updateMonthlyBoard({ createIfMissing: true });
-  }, 2500);
-}
+/* =========================
+   Buttons actions
+========================= */
+discordClient.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isButton()) return;
+
+    if (interaction.customId === "board_refresh") {
+      await interaction.deferUpdate();
+      await updateMonthlyBoardEmbed({ reason: "button_refresh" });
+      return;
+    }
+
+    if (interaction.customId === "board_today") {
+      const events = await fetchNextMonthEvents({ showDeleted: false });
+
+      const todayKey = localDayKey(new Date());
+      const todayEvents = events
+        .filter(e => e.status !== "cancelled")
+        .filter(e => {
+          const d = eventStartDate(e);
+          return d && localDayKey(d) === todayKey;
+        })
+        .sort((a, b) => {
+          const aAll = isAllDay(a);
+          const bAll = isAllDay(b);
+          if (aAll && !bAll) return -1;
+          if (!aAll && bAll) return 1;
+
+          const aS = a?.start?.dateTime ? new Date(a.start.dateTime).getTime() : 0;
+          const bS = b?.start?.dateTime ? new Date(b.start.dateTime).getTime() : 0;
+          return aS - bS;
+        });
+
+      const embed = new EmbedBuilder()
+        .setTitle("📌 היום ביומן")
+        .setColor(EMBED_COLOR)
+        .setThumbnail(THUMB_URL)
+        .setFooter({ text: "חבילת העריכה הכוללת - יומן רשמי" });
+
+      if (todayEvents.length === 0) {
+        embed.setDescription("אין אירועים להיום ✅");
+      } else {
+        const lines = todayEvents.map(ev => {
+          const t = timeRangeLabel(ev);
+          const title = safeTitle(ev);
+          return `🔹 **${t}** - \`${title}\``;
+        });
+        embed.setDescription(lines.join("\n"));
+      }
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+  } catch (err) {
+    console.error("interactionCreate error:", err);
+  }
+});
 
 /* =========================
-   Change feed (new/updated/cancelled)
+   Change tracking (updates channel)
 ========================= */
-const knownEvents = new Map(); // id -> updated
+const knownMeta = new Map(); // id -> snapshot
+
+function snapshotMeta(ev) {
+  const title = safeTitle(ev);
+  const allDay = isAllDay(ev);
+  const startRaw = ev?.start?.date || ev?.start?.dateTime || "";
+  const endRaw = ev?.end?.date || ev?.end?.dateTime || "";
+
+  const startD = eventStartDate(ev);
+  const dateText = startD ? `${dayNameHe(startD)} - ${dateShort(startD)}` : "תאריך לא ידוע";
+  const timeText = timeRangeLabel(ev);
+
+  return { title, allDay, startRaw, endRaw, dateText, timeText };
+}
+
+function buildDiff(oldM, newM) {
+  const diffs = [];
+
+  if (oldM.title !== newM.title) {
+    diffs.push(`- כותרת: \`${oldM.title}\` -> \`${newM.title}\``);
+  }
+
+  if (oldM.dateText !== newM.dateText || oldM.timeText !== newM.timeText) {
+    diffs.push(`- זמן: \`${oldM.dateText} | ${oldM.timeText}\` -> \`${newM.dateText} | ${newM.timeText}\``);
+  }
+
+  if (diffs.length === 0) diffs.push("- עודכן (שינוי קטן/לא מזוהה)");
+  return diffs.join("\n");
+}
+
+function buildUpdateEmbed({ type, ev, oldMeta }) {
+  const title = safeTitle(ev);
+  const link = eventLink(ev);
+
+  let emoji = "📌";
+  let header = "עדכון ביומן";
+  if (type === "created") { emoji = "🆕"; header = "אירוע חדש"; }
+  if (type === "updated") { emoji = "✏️"; header = "אירוע עודכן"; }
+  if (type === "cancelled") { emoji = "❌"; header = "אירוע בוטל"; }
+
+  const newMeta = snapshotMeta(ev);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${emoji} ${header}`)
+    .setColor(EMBED_COLOR)
+    .setThumbnail(THUMB_URL)
+    .setDescription(`\`${title}\``)
+    .addFields(
+      { name: "📆 תאריך", value: newMeta.dateText, inline: false },
+      { name: "🕒 שעה", value: newMeta.timeText, inline: false }
+    )
+    .setFooter({ text: "חבילת העריכה הכוללת - התראות יומן" });
+
+  if (type === "updated" && oldMeta) {
+    embed.addFields({ name: "🔁 מה השתנה?", value: buildDiff(oldMeta, newMeta), inline: false });
+  }
+
+  if (type === "cancelled" && oldMeta) {
+    embed.addFields({
+      name: "ℹ️ פרטי האירוע (לפני הביטול)",
+      value: `- \`${oldMeta.title}\`\n- ${oldMeta.dateText}\n- ${oldMeta.timeText}`,
+      inline: false
+    });
+  }
+
+  const components = [];
+  if (link) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("פתח ביומן").setURL(link)
+      )
+    );
+  }
+
+  return { embed, components };
+}
 
 async function warmupKnownEvents() {
   try {
-    const now = new Date();
-    const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-    const timeMax = new Date(now.getTime() + 35 * 24 * 60 * 60 * 1000).toISOString();
-    const events = await fetchEventsRange({ timeMin, timeMax, showDeleted: true, orderBy: "updated" });
-
+    const events = await fetchNextMonthEvents({ showDeleted: true });
     for (const ev of events) {
       if (!ev?.id) continue;
-      knownEvents.set(ev.id, ev.updated || "");
+      if (ev.status === "cancelled") continue;
+      knownMeta.set(ev.id, snapshotMeta(ev));
     }
-    console.log(`Known events warmup: ${knownEvents.size}`);
+    console.log(`Known events warmup: ${knownMeta.size}`);
   } catch (err) {
     console.error("warmupKnownEvents error:", err);
   }
 }
 
-function emojiForChange(type) {
-  if (type === "created") return "🆕";
-  if (type === "updated") return "✏️";
-  if (type === "cancelled") return "❌";
-  return "📌";
-}
-
-function labelForChange(type) {
-  if (type === "created") return "אירוע חדש";
-  if (type === "updated") return "אירוע עודכן";
-  if (type === "cancelled") return "אירוע בוטל";
-  return "עדכון";
-}
-
-function buildChangesEmbed(changes) {
-  const lines = changes.slice(0, 15).map(({ type, ev }) => {
-    const title = safeTitle(ev);
-    const when = eventWhenText(ev);
-    const link = ev.htmlLink ? ev.htmlLink : "";
-    const e = emojiForChange(type);
-    const t = labelForChange(type);
-    return `${e} **${t}** - ${link ? `[${title}](${link})` : title}\n- ${when}`;
-  });
-
-  const embed = new EmbedBuilder()
-    .setTitle("📣 עדכונים ביומן")
-    .setDescription(lines.join("\n\n"))
-    .setFooter({ text: "הודעה אוטומטית מהבוט" });
-
-  if (changes.length > 15) {
-    embed.addFields({
-      name: "עוד עדכונים",
-      value: `יש עוד ${changes.length - 15} עדכונים - אם תרצה אוסיף סיכום מורחב.`
-    });
-  }
-
-  return embed;
-}
-
 /* =========================
-   Google Watch
+   Google Watch + Webhook
 ========================= */
 let watchState = {
   channelId: null,
@@ -364,15 +487,23 @@ let watchState = {
   lastUpdatedMin: null
 };
 
-app.get("/watch/start", async (req, res) => {
+async function startWatchSilently() {
   try {
-    const calendar = getCalendarClient();
+    // אם יש Watch קודם - ננסה לעצור אותו (לא חובה אבל נקי)
+    if (watchState.channelId && watchState.resourceId) {
+      try {
+        await cal().channels.stop({
+          requestBody: { id: watchState.channelId, resourceId: watchState.resourceId }
+        });
+      } catch (_) {}
+    }
+
     const channelId = crypto.randomUUID();
     const webhookUrl = "https://calendar-discord-backend.onrender.com/webhook/google";
 
-    watchState.lastUpdatedMin = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    watchState.lastUpdatedMin = new Date(Date.now() - 15 * 60 * 1000).toISOString();
 
-    const response = await calendar.events.watch({
+    const response = await cal().events.watch({
       calendarId: CALENDAR_ID,
       requestBody: {
         id: channelId,
@@ -385,33 +516,41 @@ app.get("/watch/start", async (req, res) => {
     watchState.resourceId = response.data.resourceId;
     watchState.expiration = response.data.expiration;
 
-    res.json({
-      ok: true,
-      message: "Watch started ✅",
+    console.log("Watch started ✅", {
       channelId: watchState.channelId,
       resourceId: watchState.resourceId,
-      expiration: watchState.expiration,
-      webhook: webhookUrl
+      expiration: watchState.expiration
     });
   } catch (err) {
-    console.error("Watch start error:", err);
-    res.status(500).send("Failed to start watch");
+    console.error("startWatchSilently error:", err);
   }
+}
+
+app.get("/watch/start", async (req, res) => {
+  await startWatchSilently();
+  res.json({ ok: true, message: "Watch started ✅", watchState });
+});
+
+app.get("/watch/status", (req, res) => {
+  res.json({
+    ok: true,
+    watchActive: !!watchState.channelId,
+    watchState,
+    boardChannelId: BOARD_CHANNEL_ID,
+    updatesChannelId: UPDATES_CHANNEL_ID,
+    boardMessageId: BOARD_MESSAGE_ID || null,
+    autoWatch: AUTO_WATCH
+  });
 });
 
 app.get("/watch/stop", async (req, res) => {
   try {
-    const calendar = getCalendarClient();
-
     if (!watchState.channelId || !watchState.resourceId) {
       return res.json({ ok: true, message: "No active watch to stop" });
     }
 
-    await calendar.channels.stop({
-      requestBody: {
-        id: watchState.channelId,
-        resourceId: watchState.resourceId
-      }
+    await cal().channels.stop({
+      requestBody: { id: watchState.channelId, resourceId: watchState.resourceId }
     });
 
     watchState = { channelId: null, resourceId: null, expiration: null, lastUpdatedMin: null };
@@ -429,13 +568,16 @@ app.post("/webhook/google", async (req, res) => {
     const resourceState = req.get("x-goog-resource-state");
     const channelId = req.get("x-goog-channel-id");
 
-    if (!watchState.channelId || channelId !== watchState.channelId) return;
+    console.log("Webhook received:", { resourceState, channelId });
 
-    // "sync" מגיע לפעמים - עדיין נעדכן לוח אבל לא נספים
-    const calendar = getCalendarClient();
+    if (!watchState.channelId || channelId !== watchState.channelId) {
+      console.log("Webhook ignored: watch is not active or channelId mismatch");
+      return;
+    }
 
-    const updatedMin = watchState.lastUpdatedMin || new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    const response = await calendar.events.list({
+    const updatedMin = watchState.lastUpdatedMin || new Date(Date.now() - 20 * 60 * 1000).toISOString();
+
+    const resp = await cal().events.list({
       calendarId: CALENDAR_ID,
       updatedMin,
       maxResults: 50,
@@ -444,47 +586,45 @@ app.post("/webhook/google", async (req, res) => {
       showDeleted: true
     });
 
-    watchState.lastUpdatedMin = new Date(Date.now() - 5 * 1000).toISOString();
+    const items = resp.data.items || [];
 
-    const items = response.data.items || [];
-    if (items.length === 0) {
-      // עדיין נעדכן לוח כדי להיות בטוחים
-      scheduleBoardUpdate();
-      return;
+    // עדכון lastUpdatedMin
+    let maxUpdated = null;
+    for (const ev of items) {
+      if (ev?.updated) {
+        if (!maxUpdated || ev.updated > maxUpdated) maxUpdated = ev.updated;
+      }
     }
+    watchState.lastUpdatedMin = maxUpdated
+      ? new Date(new Date(maxUpdated).getTime() - 1000).toISOString()
+      : new Date(Date.now() - 5000).toISOString();
 
-    const changes = [];
+    // תמיד נעדכן לוח (edit להודעה אחת)
+    await updateMonthlyBoardEmbed({ reason: "webhook" });
+
+    // לא שולחים הודעות "sync" כדי לא להספים
+    if (resourceState === "sync") return;
+
+    if (items.length === 0) return;
+
+    const updatesChannel = await discordClient.channels.fetch(UPDATES_CHANNEL_ID);
 
     for (const ev of items) {
       if (!ev?.id) continue;
 
-      const prevUpdated = knownEvents.get(ev.id);
-      const isCancelled = ev.status === "cancelled";
+      const oldM = knownMeta.get(ev.id);
+      const cancelled = ev.status === "cancelled";
 
-      if (isCancelled) {
-        // בוטל
-        changes.push({ type: "cancelled", ev });
-        knownEvents.delete(ev.id);
-        continue;
-      }
+      let type = "updated";
+      if (!oldM && !cancelled) type = "created";
+      if (cancelled) type = "cancelled";
 
-      if (!prevUpdated) {
-        changes.push({ type: "created", ev });
-      } else if ((ev.updated || "") !== prevUpdated) {
-        changes.push({ type: "updated", ev });
-      }
+      const { embed, components } = buildUpdateEmbed({ type, ev, oldMeta: oldM });
 
-      knownEvents.set(ev.id, ev.updated || "");
-    }
+      if (cancelled) knownMeta.delete(ev.id);
+      else knownMeta.set(ev.id, snapshotMeta(ev));
 
-    // עדכון לוח חודשי (edit להודעה אחת)
-    scheduleBoardUpdate();
-
-    // שליחת עדכונים לחדר העדכונים
-    if (changes.length > 0 && resourceState !== "sync") {
-      const channel = await discordClient.channels.fetch(UPDATES_CHANNEL_ID);
-      const embed = buildChangesEmbed(changes);
-      await channel.send({ embeds: [embed] });
+      await updatesChannel.send({ embeds: [embed], components });
     }
   } catch (err) {
     console.error("Webhook handling error:", err);
@@ -492,61 +632,29 @@ app.post("/webhook/google", async (req, res) => {
 });
 
 /* =========================
-   Buttons (Today / Refresh)
+   Debug - test update channel permissions
 ========================= */
-discordClient.on("interactionCreate", async (interaction) => {
+app.get("/debug/test-update", async (req, res) => {
   try {
-    if (!interaction.isButton()) return;
+    const ch = await discordClient.channels.fetch(UPDATES_CHANNEL_ID);
+    const embed = new EmbedBuilder()
+      .setTitle("✅ בדיקת שליחה - ערוץ עדכונים")
+      .setColor(EMBED_COLOR)
+      .setThumbnail(THUMB_URL)
+      .setDescription("אם אתה רואה את זה - לבוט יש הרשאה לשלוח כאן.")
+      .setFooter({ text: "בדיקה" });
 
-    if (interaction.customId === "board_today") {
-      const now = new Date();
-      const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-      const timeMax = new Date(now.getTime() + 35 * 24 * 60 * 60 * 1000).toISOString();
-      const events = await fetchEventsRange({ timeMin, timeMax, showDeleted: false, orderBy: "startTime" });
-
-      const embed = buildTodayEmbed(events);
-      return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (interaction.customId === "board_refresh") {
-      await interaction.deferUpdate();
-      await updateMonthlyBoard({ createIfMissing: true });
-      return;
-    }
-  } catch (err) {
-    console.error("interactionCreate error:", err);
-  }
-});
-
-/* =========================
-   Setup endpoint (creates board + returns msg id)
-========================= */
-app.get("/board/setup", async (req, res) => {
-  await updateMonthlyBoard({ createIfMissing: true });
-  res.json({
-    ok: true,
-    boardChannelId: BOARD_CHANNEL_ID,
-    boardMessageId: cachedBoardMessageId || null,
-    note: "If boardMessageId is not saved in ENV, set BOARD_MESSAGE_ID to this value for persistence."
-  });
-});
-
-/* =========================
-   Tests / Health
-========================= */
-app.get("/test-calendar", async (req, res) => {
-  try {
-    const now = new Date();
-    const timeMin = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-    const timeMax = new Date(now.getTime() + 35 * 24 * 60 * 60 * 1000).toISOString();
-    const events = await fetchEventsRange({ timeMin, timeMax, showDeleted: false, orderBy: "startTime" });
-    res.json(events);
+    await ch.send({ embeds: [embed] });
+    res.send("Sent test update embed ✅");
   } catch (err) {
     console.error(err);
-    res.status(500).send("Failed to fetch events");
+    res.status(500).send("Failed to send test embed");
   }
 });
 
+/* =========================
+   Health
+========================= */
 app.get("/", (req, res) => {
   res.send("Backend is running ✅");
 });
