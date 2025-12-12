@@ -317,7 +317,6 @@ async function updateMonthlyBoardEmbed({ reason = "unknown" } = {}) {
     const row = buildBoardButtons();
 
     await msg.edit({ embeds: [embed], components: [row] });
-    // console.log(`Board updated (${reason})`);
   } catch (err) {
     console.error("updateMonthlyBoardEmbed error:", err);
   } finally {
@@ -401,55 +400,92 @@ function snapshotMeta(ev) {
   return { title, allDay, startRaw, endRaw, dateText, timeText };
 }
 
-function buildDiff(oldM, newM) {
-  const diffs = [];
-
-  if (oldM.title !== newM.title) {
-    diffs.push(`- כותרת: \`${oldM.title}\` -> \`${newM.title}\``);
-  }
-
-  if (oldM.dateText !== newM.dateText || oldM.timeText !== newM.timeText) {
-    diffs.push(`- זמן: \`${oldM.dateText} | ${oldM.timeText}\` -> \`${newM.dateText} | ${newM.timeText}\``);
-  }
-
-  if (diffs.length === 0) diffs.push("- עודכן (שינוי קטן/לא מזוהה)");
-  return diffs.join("\n");
-}
-
+/* =========================
+   UPDATE EMBEDS - EXACTLY YOUR WORDING
+========================= */
 function buildUpdateEmbed({ type, ev, oldMeta }) {
-  const title = safeTitle(ev);
   const link = eventLink(ev);
-
-  let emoji = "📌";
-  let header = "עדכון ביומן";
-  if (type === "created") { emoji = "🆕"; header = "אירוע חדש"; }
-  if (type === "updated") { emoji = "✏️"; header = "אירוע עודכן"; }
-  if (type === "cancelled") { emoji = "❌"; header = "אירוע בוטל"; }
-
   const newMeta = snapshotMeta(ev);
+  const today = dateShort(new Date());
+  const SEP_NAME = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
+  // אם אין oldMeta (נדיר), נשתמש ב-newMeta כדי לא לשבור אמבד
+  const oldSafe = oldMeta || newMeta;
+
+  if (type === "cancelled") {
+    const embed = new EmbedBuilder()
+      .setTitle("ביטול אירוע | חבילת העריכה הכוללת")
+      .setDescription("אירוע שתוכנן מראש **בוטל**.\nלהלן פרטי האירוע כפי שהיו לפני הביטול:")
+      .setColor(15158332)
+      .addFields(
+        { name: "🛠 פעולה", value: "בוטל", inline: true },
+        { name: "📅 תאריך הביטול", value: today, inline: true },
+        { name: SEP_NAME, value: "📌 **פרטי האירוע (לפני הביטול)**" },
+        { name: "📝 כותרת האירוע", value: `**${oldSafe.title}**` },
+        { name: "📆 תאריך", value: oldSafe.dateText, inline: true },
+        { name: "⏰ שעה", value: oldSafe.timeText, inline: true }
+      )
+      .setFooter({ text: "חבילת העריכה הכוללת - מערכת אירועים" });
+
+    const components = [];
+    if (link) {
+      components.push(
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("פתח ביומן").setURL(link)
+        )
+      );
+    }
+
+    return { embed, components };
+  }
+
+  if (type === "created") {
+    const embed = new EmbedBuilder()
+      .setTitle("אירוע חדש | חבילת העריכה הכוללת")
+      .setDescription("אירוע חדש **נוסף ליומן**.\nלהלן פרטי האירוע:")
+      .setColor(5763719)
+      .addFields(
+        { name: "🛠 פעולה", value: "אירוע חדש", inline: true },
+        { name: "📅 תאריך פרסום", value: today, inline: true },
+        { name: SEP_NAME, value: "📌 **פרטי האירוע**" },
+        { name: "📝 כותרת האירוע", value: `**${newMeta.title}**` },
+        { name: "📆 תאריך", value: newMeta.dateText, inline: true },
+        { name: "⏰ שעה", value: newMeta.timeText, inline: true }
+      )
+      .setFooter({ text: "חבילת העריכה הכוללת - מערכת אירועים" });
+
+    const components = [];
+    if (link) {
+      components.push(
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("פתח ביומן").setURL(link)
+        )
+      );
+    }
+
+    return { embed, components };
+  }
+
+  // updated
   const embed = new EmbedBuilder()
-    .setTitle(`${emoji} ${header}`)
-    .setColor(EMBED_COLOR)
-    .setThumbnail(THUMB_URL)
-    .setDescription(`\`${title}\``)
+    .setTitle("עדכון אירוע | חבילת העריכה הכוללת")
+    .setDescription("אירוע קיים **עודכן**.\nלהלן פרטי האירוע לפני ואחרי העדכון:")
+    .setColor(16705372)
     .addFields(
-      { name: "📆 תאריך", value: newMeta.dateText, inline: false },
-      { name: "🕒 שעה", value: newMeta.timeText, inline: false }
+      { name: "🛠 פעולה", value: "עודכן", inline: true },
+      { name: "📅 תאריך העדכון", value: today, inline: true },
+
+      { name: SEP_NAME, value: "📌 **פרטי האירוע (לפני העדכון)**" },
+      { name: "📝 כותרת האירוע", value: oldSafe.title },
+      { name: "📆 תאריך", value: oldSafe.dateText, inline: true },
+      { name: "⏰ שעה", value: oldSafe.timeText, inline: true },
+
+      { name: SEP_NAME, value: "__📌 **פרטי האירוע (לאחר העדכון)**__" },
+      { name: "📝 כותרת האירוע", value: `**${newMeta.title}**` },
+      { name: "📆 תאריך", value: newMeta.dateText, inline: true },
+      { name: "⏰ שעה", value: newMeta.timeText, inline: true }
     )
-    .setFooter({ text: "חבילת העריכה הכוללת - התראות יומן" });
-
-  if (type === "updated" && oldMeta) {
-    embed.addFields({ name: "🔁 מה השתנה?", value: buildDiff(oldMeta, newMeta), inline: false });
-  }
-
-  if (type === "cancelled" && oldMeta) {
-    embed.addFields({
-      name: "ℹ️ פרטי האירוע (לפני הביטול)",
-      value: `- \`${oldMeta.title}\`\n- ${oldMeta.dateText}\n- ${oldMeta.timeText}`,
-      inline: false
-    });
-  }
+    .setFooter({ text: "חבילת העריכה הכוללת - מערכת אירועים" });
 
   const components = [];
   if (link) {
